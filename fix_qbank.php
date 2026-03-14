@@ -38,8 +38,8 @@ require_once($CFG->libdir.'/clilib.php');
 require_once($CFG->libdir.'/questionlib.php');
 
 // Define supported CLI options in long and short forms.
-$long = array('fix'  => false, 'help' => false, 'courseid' => null);
-$short = array('f' => 'fix', 'h' => 'help', 'c' => 'courseid');
+$long = array('fix'  => false, 'help' => false, 'courseid' => null, 'categoryid' => null);
+$short = array('f' => 'fix', 'h' => 'help', 'c' => 'courseid', 'g' => 'categoryid');
 
 // Parse CLI arguments and capture any unrecognized options.
 list($options, $unrecognized) = cli_get_params($long, $short);
@@ -65,11 +65,13 @@ if ($options['help']) {
 
         Options:
         -h, --help            Print out this help
-        -c, --courseid        Mandatory course ID
+        -c, --courseid        Course ID to analyze
+        -g, --categoryid      Course category ID to analyze
         -f, --fix             Remove eligible question categories from the DB.
                       If not specified only check and report findings.
         Example:
         \$sudo -u www-data /usr/bin/php admin/cli/fix_qbank.php --courseid=2
+        \$sudo -u www-data /usr/bin/php admin/cli/fix_qbank.php --categoryid=5
         \$sudo -u www-data /usr/bin/php admin/cli/fix_qbank.php --courseid=2 -f
         ";
 
@@ -77,33 +79,53 @@ if ($options['help']) {
     die;
 }
 
-// Validate the required course ID input and ensure the target course exists.
-if (empty($options['courseid']) || !is_numeric($options['courseid'])) {
-    cli_error('You must provide a valid course ID via --courseid=<id>.');
+// Validate target scope: either a course or a course category must be provided.
+$hascourseid = !empty($options['courseid']);
+$hascategoryid = !empty($options['categoryid']);
+
+if ($hascourseid && $hascategoryid) {
+    cli_error('Provide either --courseid=<id> or --categoryid=<id>, not both.');
 }
 
-$courseid = (int)$options['courseid'];
-if (!$DB->record_exists('course', array('id' => $courseid))) {
-    cli_error("Course ID {$courseid} does not exist.");
+if (!$hascourseid && !$hascategoryid) {
+    cli_error('You must provide --courseid=<id> or --categoryid=<id>.');
 }
 
-// Print a section header to indicate the start of the category audit phase.
-cli_heading('Auditing question categories for cleanup eligibility');
+$iscategorymode = false;
+$coursecategory = null;
+$coursestoprocess = array();
 
-// Fetch all question categories for the target course context, ordered by category name.
-$sql = 'SELECT qc.id, qc.name, qc.contextid
-          FROM {question_categories} qc
-          JOIN {context} c ON c.id = qc.contextid
-         WHERE c.contextlevel = :contextlevel
-           AND c.instanceid = :courseid
-      ORDER BY qc.name';
-$params = array('contextlevel' => CONTEXT_COURSE, 'courseid' => $courseid);
-$categories = $DB->get_records_sql($sql, $params);
+if ($hascourseid) {
+    if (!is_numeric($options['courseid'])) {
+        cli_error('You must provide a valid course ID via --courseid=<id>.');
+    }
 
-// Exit early when the course has no question categories.
-if (empty($categories)) {
-    echo "No question categories found for course {$courseid}.\n";
-    exit(0);
+    $courseid = (int)$options['courseid'];
+    $course = $DB->get_record('course', array('id' => $courseid), 'id, fullname');
+    if (!$course) {
+        cli_error("Course ID {$courseid} does not exist.");
+    }
+
+    $coursestoprocess[] = $course;
+} else {
+    if (!is_numeric($options['categoryid'])) {
+        cli_error('You must provide a valid category ID via --categoryid=<id>.');
+    }
+
+    $categoryid = (int)$options['categoryid'];
+    $coursecategory = $DB->get_record('course_categories', array('id' => $categoryid), 'id, name');
+    if (!$coursecategory) {
+        cli_error("Category ID {$categoryid} does not exist.");
+    }
+
+    $coursestoprocess = $DB->get_records('course', array('category' => $categoryid), 'fullname ASC', 'id, fullname');
+    if (empty($coursestoprocess)) {
+        echo "No courses found in category {$coursecategory->name}.\n";
+        exit(0);
+    }
+
+    $iscategorymode = true;
+    echo "Checking courses in category: {$coursecategory->name}\n";
 }
 
 // Collect context IDs used by random quiz questions to avoid deleting categories that
@@ -119,81 +141,105 @@ foreach ($randomcontexts as $randomcontext) {
     $randomcontextids[(int)$randomcontext->questionscontextid] = true;
 }
 
-// Prepare result buckets: eligible, ineligible, and categories referenced by random usage.
-$categoriestoclean = array();
-$categoriesnottoclean = array();
-$categoriesusedinrandom = array();
-
-foreach ($categories as $category) {
-    $questioncount = $DB->count_records('question_bank_entries', array('questioncategoryid' => $category->id));
-
-    $sqlunused = 'SELECT COUNT(qbe.id)
-                    FROM {question_bank_entries} qbe
-                   WHERE qbe.questioncategoryid = :categoryid
-                     AND NOT EXISTS (
-                         SELECT 1
-                           FROM {question_references} qr
-                           JOIN {quiz_slots} qs ON qs.id = qr.itemid
-                           JOIN {quiz} qz ON qz.id = qs.quizid
-                          WHERE qr.questionbankentryid = qbe.id
-                            AND qr.component = :component
-                            AND qr.questionarea = :questionarea
-                            AND qz.course = :courseidforusage
-                     )';
-    $unusedparams = array(
-        'categoryid' => $category->id,
-        'component' => 'mod_quiz',
-        'questionarea' => 'slot',
-        'courseidforusage' => $courseid
-    );
-    $unusedquestioncount = (int)$DB->count_records_sql($sqlunused, $unusedparams);
-
-    $usedinrandom = !empty($randomcontextids[(int)$category->contextid]);
-    if ($usedinrandom) {
-        $categoriesusedinrandom[] = $category->name;
+$totalcourses = count($coursestoprocess);
+$processedcourses = 0;
+foreach ($coursestoprocess as $course) {
+    if ($iscategorymode) {
+        $processedcourses += 1;
+        echo "Checking course {$processedcourses}/{$totalcourses}\n";
     }
 
-    if (!$usedinrandom && ($unusedquestioncount === $questioncount)) {
-        $categoriestoclean[] = $category;
+    $courseid = (int)$course->id;
+
+    // Fetch all question categories for the target course context, ordered by category name.
+    $sql = 'SELECT qc.id, qc.name, qc.contextid
+              FROM {question_categories} qc
+              JOIN {context} c ON c.id = qc.contextid
+             WHERE c.contextlevel = :contextlevel
+               AND c.instanceid = :courseid
+          ORDER BY qc.name';
+    $params = array('contextlevel' => CONTEXT_COURSE, 'courseid' => $courseid);
+    $categories = $DB->get_records_sql($sql, $params);
+
+    // Skip courses without question categories.
+    if (empty($categories)) {
+        echo "No question categories found for course {$courseid}.\n";
+        continue;
+    }
+
+    // Prepare result buckets: eligible and categories referenced by random usage.
+    $categoriestoclean = array();
+    $categoriesusedinrandom = array();
+
+    // Iterate over each category to evaluate random usage and cleanup eligibility.
+    foreach ($categories as $category) {
+        // Count total questions in the current category for comparison with unused questions.
+        $questioncount = $DB->count_records('question_bank_entries', array('questioncategoryid' => $category->id));
+
+        // Build and run a query that counts only category questions with no
+        // references in quiz slots from this course.
+        $sqlunused = 'SELECT COUNT(qbe.id)
+                        FROM {question_bank_entries} qbe
+                       WHERE qbe.questioncategoryid = :categoryid
+                         AND NOT EXISTS (
+                             SELECT 1
+                               FROM {question_references} qr
+                               JOIN {quiz_slots} qs ON qs.id = qr.itemid
+                               JOIN {quiz} qz ON qz.id = qs.quizid
+                              WHERE qr.questionbankentryid = qbe.id
+                                AND qr.component = :component
+                                AND qr.questionarea = :questionarea
+                                AND qz.course = :courseidforusage
+                         )';
+        $unusedparams = array(
+            'categoryid' => $category->id,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'courseidforusage' => $courseid
+        );
+        $unusedquestioncount = (int)$DB->count_records_sql($sqlunused, $unusedparams);
+
+        // Flag categories whose context appears in random-question references.
+        $usedinrandom = !empty($randomcontextids[(int)$category->contextid]);
+        if ($usedinrandom) {
+            $categoriesusedinrandom[] = $category->name;
+        }
+
+        // A category is cleanable only when it is not used by random slots and
+        // all its questions are unused in quiz slots from this course.
+        if (!$usedinrandom && ($unusedquestioncount === $questioncount)) {
+            $categoriestoclean[] = $category;
+        }
+    }
+
+    cli_heading("Categories eligible for cleanup in course: {$course->fullname}");
+
+    $i = 0;
+    // Walk through all eligible categories, report each one, and optionally delete it.
+    foreach ($categoriestoclean as $category) {
+        $i += 1;
+        echo "--> {$category->name}\n";
+        if (!empty($options['fix'])) {
+            echo "Cleaning...";
+            // One transaction per category.
+            $transaction = $DB->start_delegated_transaction();
+            question_category_delete_safe($category);
+            $transaction->allow_commit();
+            echo "  Done!\n";
+        }
+    }
+
+    // Print a final summary: removed count with --fix, or guidance for a dry-run result.
+    if (($i > 0) && !empty($options['fix'])) {
+        echo "Found and removed {$i} eligible question categories\n";
+    } else if ($i > 0) {
+        echo "Found {$i} eligible question categories. To fix, run:\n";
+        if ($iscategorymode) {
+            echo "\$sudo -u www-data /usr/bin/php admin/cli/fix_qbank.php --categoryid={$coursecategory->id} --fix\n";
+        } else {
+            echo "\$sudo -u www-data /usr/bin/php admin/cli/fix_qbank.php --courseid={$courseid} --fix\n";
+        }
     } else {
-        $categoriesnottoclean[] = $category;
+        echo "No eligible question categories found.\n";
     }
-
-    $usedinrandomtext = $usedinrandom ? 'sim' : 'nao';
-
-    echo "{$category->name} ({$unusedquestioncount} nao usadas de {$questioncount}, random: {$usedinrandomtext})\n";
-}
-
-echo "Categories that will NOT be cleaned:\n";
-if (!empty($categoriesnottoclean)) {
-    foreach ($categoriesnottoclean as $category) {
-        echo "- {$category->name}\n";
-    }
-} else {
-    echo "- none\n";
-}
-
-cli_heading('Checking categories eligible for cleanup');
-
-$i = 0;
-foreach ($categoriestoclean as $category) {
-    $i += 1;
-    echo "Found category eligible for cleanup: {$category->name}\n";
-    if (!empty($options['fix'])) {
-        echo "Cleaning...";
-        // One transaction per category.
-        $transaction = $DB->start_delegated_transaction();
-        question_category_delete_safe($category);
-        $transaction->allow_commit();
-        echo "  Done!\n";
-    }
-}
-
-if (($i > 0) && !empty($options['fix'])) {
-    echo "Found and removed {$i} eligible question categories\n";
-} else if ($i > 0) {
-    echo "Found {$i} eligible question categories. To fix, run:\n";
-    echo "\$sudo -u www-data /usr/bin/php admin/cli/fix_qbank.php --courseid={$courseid} --fix\n";
-} else {
-    echo "No eligible question categories found.\n";
 }
