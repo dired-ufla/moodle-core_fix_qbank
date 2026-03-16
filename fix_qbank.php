@@ -15,13 +15,15 @@
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
 /**
- * This script audits question categories for a specific course.
+ * This script audits question categories for a specific course or an entire
+ * course category.
  *
  * A category is considered eligible for cleanup when all its questions are
  * unused in quiz slots from the same course and the category context is not
  * referenced by random question usage.
  *
- * With --fix, eligible categories are removed using question_category_delete_safe().
+ * With --fix, eligible categories are removed using
+ * question_category_delete_safe().
  *
  * @package    core
  * @subpackage cli
