@@ -145,6 +145,7 @@ foreach ($randomcontexts as $randomcontext) {
 
 $totalcourses = count($coursestoprocess);
 $processedcourses = 0;
+$recentthreshold = time() - (60 * DAYSECS);
 foreach ($coursestoprocess as $course) {
     if ($iscategorymode) {
         $processedcourses += 1;
@@ -178,26 +179,30 @@ foreach ($coursestoprocess as $course) {
         // Count total questions in the current category for comparison with unused questions.
         $questioncount = $DB->count_records('question_bank_entries', array('questioncategoryid' => $category->id));
 
-        // Build and run a query that counts only category questions with no
-        // references in quiz slots from this course.
-        $sqlunused = 'SELECT COUNT(qbe.id)
-                        FROM {question_bank_entries} qbe
-                       WHERE qbe.questioncategoryid = :categoryid
-                         AND NOT EXISTS (
-                             SELECT 1
-                               FROM {question_references} qr
-                               JOIN {quiz_slots} qs ON qs.id = qr.itemid
-                               JOIN {quiz} qz ON qz.id = qs.quizid
-                              WHERE qr.questionbankentryid = qbe.id
-                                AND qr.component = :component
-                                AND qr.questionarea = :questionarea
-                                AND qz.course = :courseidforusage
-                         )';
+                // Build and run a query that counts category questions with no
+                // quiz-slot references in any course and no updates in the last 60 days.
+                $sqlunused = 'SELECT COUNT(qbe.id) FROM {question_bank_entries} qbe
+                                WHERE qbe.questioncategoryid = :categoryid
+                                    AND NOT EXISTS (
+                                        SELECT 1
+                                            FROM {question_references} qr
+                                            JOIN {quiz_slots} qs ON qs.id = qr.itemid
+                                                WHERE qr.questionbankentryid = qbe.id
+                                                    AND qr.component = :component
+                                                    AND qr.questionarea = :questionarea
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1
+                                            FROM {question_versions} qv
+                                            JOIN {question} q ON q.id = qv.questionid
+                                                WHERE qv.questionbankentryid = qbe.id
+                                                    AND q.timemodified >= :recentthreshold
+                                    )';
         $unusedparams = array(
             'categoryid' => $category->id,
             'component' => 'mod_quiz',
-            'questionarea' => 'slot',
-            'courseidforusage' => $courseid
+                        'questionarea' => 'slot',
+                        'recentthreshold' => $recentthreshold
         );
         $unusedquestioncount = (int)$DB->count_records_sql($sqlunused, $unusedparams);
 
@@ -208,7 +213,7 @@ foreach ($coursestoprocess as $course) {
         }
 
         // A category is cleanable only when it is not used by random slots and
-        // all its questions are unused in quiz slots from this course.
+        // all its questions are unused in quiz slots from any course.
         if (!$usedinrandom && ($unusedquestioncount === $questioncount)) {
             $categoriestoclean[] = $category;
         }
