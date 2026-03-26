@@ -153,6 +153,9 @@ foreach ($coursestoprocess as $course) {
     }
 
     $courseid = (int)$course->id;
+    $coursestartdatetime = date('Y-m-d H:i:s');
+    $coursestarttime = microtime(true);
+    echo "{$coursestartdatetime} - Start processing course: {$courseid} - {$course->fullname}\n";
 
     // Fetch all question categories for the target course context, ordered by category name.
     $sql = 'SELECT qc.id, qc.name, qc.contextid
@@ -166,7 +169,7 @@ foreach ($coursestoprocess as $course) {
 
     // Skip courses without question categories.
     if (empty($categories)) {
-        echo "No question categories found for course {$courseid}.\n";
+        echo "No question categories found for this course.\n";
         continue;
     }
 
@@ -219,7 +222,7 @@ foreach ($coursestoprocess as $course) {
         }
     }
 
-    cli_heading("Categories eligible for cleanup in course: {$course->fullname}");
+    cli_heading("Categories eligible for cleanup in this course");
 
     $i = 0;
     // Walk through all eligible categories, report each one, and optionally delete it.
@@ -249,4 +252,8 @@ foreach ($coursestoprocess as $course) {
     } else {
         echo "No eligible question categories found.\n";
     }
+
+    $courseenddatetime = date('Y-m-d H:i:s');
+    $courseelapsedseconds = microtime(true) - $coursestarttime;
+    echo "{$courseenddatetime} - Finished processing course: {$courseid} - {$course->fullname}\n";
 }
