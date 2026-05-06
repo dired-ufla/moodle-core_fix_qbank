@@ -130,19 +130,6 @@ if ($hascourseid) {
     echo "Checking courses in category: {$coursecategory->name}\n";
 }
 
-// Collect context IDs used by random quiz questions to avoid deleting categories that
-// still feed random question slots; indexing them enables quick eligibility checks per category.
-$sqlrandom = 'SELECT DISTINCT qsr.questionscontextid
-                FROM {question_set_references} qsr
-               WHERE qsr.component = :component
-                 AND qsr.questionarea = :questionarea';
-$randomcontexts = $DB->get_records_sql($sqlrandom, array('component' => 'mod_quiz', 'questionarea' => 'slot'));
-
-$randomcontextids = array();
-foreach ($randomcontexts as $randomcontext) {
-    $randomcontextids[(int)$randomcontext->questionscontextid] = true;
-}
-
 $totalcourses = count($coursestoprocess);
 $processedcourses = 0;
 $recentthreshold = time() - (60 * DAYSECS);
@@ -158,7 +145,7 @@ foreach ($coursestoprocess as $course) {
     echo "{$coursestartdatetime} - Start processing course: {$courseid} - {$course->fullname}\n";
 
     // Fetch all question categories for the target course context, ordered by category name.
-    $sql = 'SELECT qc.id, qc.name, qc.contextid
+        $sql = 'SELECT qc.id, qc.name, qc.contextid, qc.parent
               FROM {question_categories} qc
               JOIN {context} c ON c.id = qc.contextid
              WHERE c.contextlevel = :contextlevel
@@ -173,14 +160,146 @@ foreach ($coursestoprocess as $course) {
         continue;
     }
 
-    // Prepare result buckets: eligible and categories referenced by random usage.
+    // Prepare result bucket for cleanup candidates.
     $categoriestoclean = array();
-    $categoriesusedinrandom = array();
+    $categoriestokeep = array();
+
+    // Build parent map for category hierarchy checks used by random-slot filters.
+    $parentbycategoryid = array();
+    foreach ($categories as $existingcategory) {
+        $parentbycategoryid[(int)$existingcategory->id] = isset($existingcategory->parent) ? (int)$existingcategory->parent : 0;
+    }
+
+    // Load all random-slot references for this context once and map quizzes to categories.
+    $sqlrandomrefs = 'SELECT qsr.id,
+                             qsr.filtercondition,
+                             q.id AS quizid,
+                             q.name AS quizname
+                        FROM {question_set_references} qsr
+                        JOIN {quiz_slots} qs ON qs.id = qsr.itemid
+                        JOIN {quiz} q ON q.id = qs.quizid
+                       WHERE qsr.questionscontextid = :contextid
+                         AND qsr.component = :component
+                         AND qsr.questionarea = :questionarea';
+    $randomrefs = $DB->get_records_sql($sqlrandomrefs, array(
+        'contextid' => reset($categories)->contextid,
+        'component' => 'mod_quiz',
+        'questionarea' => 'slot',
+    ));
+
+    $randomquizzesbycategoryid = array();
+    foreach ($categories as $existingcategory) {
+        $randomquizzesbycategoryid[(int)$existingcategory->id] = array();
+    }
+
+    // Returns true when the selected category is an ancestor of the candidate category.
+    $isancestorof = function($selectedcategoryid, $candidatecategoryid) use (&$parentbycategoryid) {
+        $selectedcategoryid = (int)$selectedcategoryid;
+        $current = (int)$candidatecategoryid;
+
+        while ($current > 0) {
+            if ($current === $selectedcategoryid) {
+                return true;
+            }
+
+            if (!isset($parentbycategoryid[$current])) {
+                break;
+            }
+
+            $current = (int)$parentbycategoryid[$current];
+        }
+
+        return false;
+    };
+
+    foreach ($randomrefs as $randomref) {
+        $selectedcategoryids = array();
+        $includesubcategories = false;
+        $filterdata = json_decode((string)$randomref->filtercondition, true);
+
+        if (!empty($filterdata['filter']['category']['values']) && is_array($filterdata['filter']['category']['values'])) {
+            foreach ($filterdata['filter']['category']['values'] as $value) {
+                $selectedid = (int)$value;
+                if ($selectedid > 0) {
+                    $selectedcategoryids[$selectedid] = true;
+                }
+            }
+
+            if (isset($filterdata['filter']['category']['filteroptions']['includesubcategories'])) {
+                $includesubcategories = !empty((int)$filterdata['filter']['category']['filteroptions']['includesubcategories']);
+            }
+        }
+
+        // Backward-compatible fallback when category values are only present in the "cat" field.
+        if (empty($selectedcategoryids) && !empty($filterdata['cat']) && is_string($filterdata['cat'])) {
+            $catparts = explode(',', $filterdata['cat']);
+            $selectedid = (int)trim($catparts[0]);
+            if ($selectedid > 0) {
+                $selectedcategoryids[$selectedid] = true;
+            }
+        }
+
+        if (empty($selectedcategoryids)) {
+            continue;
+        }
+
+        $quizrecord = (object)array('id' => (int)$randomref->quizid, 'name' => $randomref->quizname);
+
+        if (!$includesubcategories) {
+            foreach (array_keys($selectedcategoryids) as $selectedcategoryid) {
+                if (isset($randomquizzesbycategoryid[$selectedcategoryid])) {
+                    $randomquizzesbycategoryid[$selectedcategoryid][$quizrecord->id] = $quizrecord;
+                }
+            }
+            continue;
+        }
+
+        foreach ($categories as $candidatecategory) {
+            $candidateid = (int)$candidatecategory->id;
+            foreach (array_keys($selectedcategoryids) as $selectedcategoryid) {
+                if ($isancestorof($selectedcategoryid, $candidateid)) {
+                    $randomquizzesbycategoryid[$candidateid][$quizrecord->id] = $quizrecord;
+                    break;
+                }
+            }
+        }
+    }
 
     // Iterate over each category to evaluate random usage and cleanup eligibility.
     foreach ($categories as $category) {
         // Count total questions in the current category for comparison with unused questions.
         $questioncount = $DB->count_records('question_bank_entries', array('questioncategoryid' => $category->id));
+
+        // Gather quiz names that use this category via fixed questions.
+        $sqlfixedquizzes = 'SELECT DISTINCT q.id, q.name
+                              FROM {question_bank_entries} qbe
+                              JOIN {question_references} qr ON qr.questionbankentryid = qbe.id
+                              JOIN {quiz_slots} qs ON qs.id = qr.itemid
+                              JOIN {quiz} q ON q.id = qs.quizid
+                             WHERE qbe.questioncategoryid = :categoryid
+                               AND qr.component = :component
+                               AND qr.questionarea = :questionarea
+                          ORDER BY q.name';
+        $fixedquizzes = $DB->get_records_sql($sqlfixedquizzes, array(
+            'categoryid' => $category->id,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+        ));
+
+        // Gather quiz names that use this specific category via random filters.
+        $randomquizzes = !empty($randomquizzesbycategoryid[(int)$category->id])
+            ? $randomquizzesbycategoryid[(int)$category->id]
+            : array();
+
+        if (!empty($fixedquizzes) || !empty($randomquizzes)) {
+            echo "Quiz usage for category {$category->name} (context {$category->contextid}):\n";
+            foreach ($fixedquizzes as $quiz) {
+                echo "  [FIXA] Quiz {$quiz->id}: {$quiz->name}\n";
+            }
+            foreach ($randomquizzes as $quiz) {
+                echo "  [ALEATORIA] Quiz {$quiz->id}: {$quiz->name}\n";
+            }
+        }
 
                 // Build and run a query that counts category questions with no
                 // quiz-slot references in any course and no updates in the last 60 days.
@@ -209,16 +328,26 @@ foreach ($coursestoprocess as $course) {
         );
         $unusedquestioncount = (int)$DB->count_records_sql($sqlunused, $unusedparams);
 
-        // Flag categories whose context appears in random-question references.
-        $usedinrandom = !empty($randomcontextids[(int)$category->contextid]);
-        if ($usedinrandom) {
-            $categoriesusedinrandom[] = $category->name;
-        }
+        // Flag only categories explicitly selected by random filters.
+        $usedinrandom = !empty($randomquizzes);
 
         // A category is cleanable only when it is not used by random slots and
         // all its questions are unused in quiz slots from any course.
         if (!$usedinrandom && ($unusedquestioncount === $questioncount)) {
             $categoriestoclean[] = $category;
+        } else {
+            $reasons = array();
+            if ($usedinrandom) {
+                $reasons[] = 'uso em questoes aleatorias';
+            }
+            if ($unusedquestioncount !== $questioncount) {
+                $reasons[] = 'possui questoes em uso ou alteradas recentemente';
+            }
+            $categoriestokeep[] = (object)array(
+                'id' => (int)$category->id,
+                'name' => $category->name,
+                'reasons' => $reasons,
+            );
         }
     }
 
@@ -236,6 +365,18 @@ foreach ($coursestoprocess as $course) {
             question_category_delete_safe($category);
             $transaction->allow_commit();
             echo "  Done!\n";
+        }
+    }
+
+    cli_heading("Categories that will NOT be deleted in this course");
+    if (empty($categoriestokeep)) {
+        echo "None.\n";
+    } else {
+        foreach ($categoriestokeep as $keptcategory) {
+            $reasontext = !empty($keptcategory->reasons)
+                ? implode('; ', $keptcategory->reasons)
+                : 'sem motivo informado';
+            echo "--> {$keptcategory->name} (ID {$keptcategory->id}) - {$reasontext}\n";
         }
     }
 
